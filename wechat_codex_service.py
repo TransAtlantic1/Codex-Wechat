@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from codex_common import (
     BotState,
+    CodexRunHandle,
     CodexRunner,
     RunningPromptRegistry,
     SessionStore,
@@ -519,6 +520,12 @@ class WechatCodexService:
         if cmd == "status":
             self._handle_status(from_user_id, context_token)
             return
+        if cmd == "kill":
+            self._handle_kill(from_user_id, context_token)
+            return
+        if cmd in ("usage", "limits", "quota"):
+            self._handle_usage(from_user_id, context_token)
+            return
         if cmd == "new":
             self._handle_new(from_user_id, context_token, arg)
             return
@@ -537,14 +544,23 @@ class WechatCodexService:
             "\n".join(
                 [
                     "可用命令:",
+                    "/help - 查看完整命令列表",
                     "/sessions [N] - 查看最近 N 条会话（标题 + 编号）",
                     "/use <编号|session_id> - 切换当前会话",
                     "/history [编号|session_id] [N] - 查看会话最近 N 条消息",
                     "/new [cwd] - 进入新会话模式（下一条普通消息会新建 session）",
                     "/status - 查看当前绑定会话",
+                    "/kill - 停止当前会话中正在思考的 Codex 任务",
+                    "/usage - 查看当前 Codex 登录状态和用量限额说明",
                     "/ask <内容> - 手动提问（可选）",
+                    "",
+                    "别名:",
+                    "/start = /help",
+                    "/limits = /usage",
+                    "/quota = /usage",
+                    "",
                     "执行 /sessions 后，可直接发送编号切换会话",
-                    "后台执行时仍可发送 /use /sessions /status",
+                    "后台执行时仍可发送 /use /sessions /status /kill",
                     "直接发普通消息即可对话（会自动续聊当前 session）",
                 ]
             ),
@@ -690,7 +706,51 @@ class WechatCodexService:
             "支持与本地 Codex 客户端交替续聊。",
         ]
         if running_count > 0:
-            lines.append(f"后台运行中: {running_count} 个任务（可继续 /use 切线程）")
+            current_running = self.running_prompts.is_running(actor_id, session_id)
+            if current_running:
+                lines.append("当前会话正在运行任务，可用 /kill 停止。")
+            if running_count > (1 if current_running else 0):
+                lines.append(f"其他会话后台运行中: {running_count - (1 if current_running else 0)} 个任务")
+        self._send_text(actor_id, context_token, "\n".join(lines))
+
+    def _handle_kill(self, actor_id: str, context_token: str) -> None:
+        session_id, _ = self.state.get_active(actor_id)
+        if not self.running_prompts.is_running(actor_id, session_id):
+            running_count = self.running_prompts.count(actor_id)
+            if running_count > 0:
+                self._send_text(
+                    actor_id,
+                    context_token,
+                    "当前会话没有正在运行的任务。其他会话可能仍在后台执行；先 /use 切到对应会话后再 /kill。",
+                )
+            else:
+                self._send_text(actor_id, context_token, "当前没有正在运行的 Codex 任务。")
+            return
+        if self.running_prompts.cancel(actor_id, session_id):
+            self._send_text(actor_id, context_token, "已请求停止当前会话中的 Codex 任务，正在收尾。")
+        else:
+            self._send_text(actor_id, context_token, "当前会话的停止请求已经发送，请稍等。")
+
+    def _handle_usage(self, actor_id: str, context_token: str) -> None:
+        stdout_text, stderr_text, return_code = self.codex.usage_status()
+        lines = ["当前用量 / 限额:"]
+        if stdout_text:
+            lines.append(stdout_text)
+        if return_code != 0:
+            lines.append(f"查询 Codex 登录状态失败 (exit={return_code})")
+        if stderr_text:
+            clean_stderr = "\n".join(
+                line for line in stderr_text.splitlines() if "could not update PATH" not in line
+            ).strip()
+            if clean_stderr:
+                lines.append(clean_stderr[-1200:])
+        lines.extend(
+            [
+                "",
+                "说明: 当前 Codex CLI 没有提供可机器读取的剩余额度/重置时间命令。",
+                "这里展示的是本机 Codex 登录状态；若后续 CLI 增加限额接口，/usage 可直接接入。",
+            ]
+        )
         self._send_text(actor_id, context_token, "\n".join(lines))
 
     def _handle_ask(self, actor_id: str, context_token: str, arg: str) -> None:
@@ -742,12 +802,13 @@ class WechatCodexService:
         cwd = Path(active_cwd).expanduser() if active_cwd else self.default_cwd
         if not cwd.exists():
             cwd = self.default_cwd
-        if not self.running_prompts.try_start(actor_id, active_id):
+        run_handle = CodexRunHandle()
+        if not self.running_prompts.try_start(actor_id, active_id, run_handle):
             busy_session = active_id[:8] if active_id else "当前线程"
             self._send_text(
                 actor_id,
                 context_token,
-                f"会话 {busy_session} 已有任务运行中。可先 /use 切到其他线程，或等待当前回复完成。",
+                f"会话 {busy_session} 已有任务运行中。可先 /kill 停止，或 /use 切到其他线程。",
             )
             return
 
@@ -756,13 +817,13 @@ class WechatCodexService:
         log(f"queue wechat prompt: actor={actor_id} mode={mode} cwd={cwd} session={active_id}")
         worker = threading.Thread(
             target=self._run_prompt_worker,
-            args=(actor_id, context_token, prompt, active_id, cwd, session_label),
+            args=(actor_id, context_token, prompt, active_id, cwd, session_label, run_handle),
             daemon=True,
         )
         try:
             worker.start()
         except Exception:
-            self.running_prompts.finish(actor_id, active_id)
+            self.running_prompts.finish(actor_id, active_id, run_handle)
             raise
 
     def _run_prompt_worker(
@@ -773,6 +834,7 @@ class WechatCodexService:
         active_id: Optional[str],
         cwd: Path,
         session_label: str,
+        run_handle: CodexRunHandle,
     ) -> None:
         typing: Optional[WechatTypingStatus] = None
         run_started_at = time.time()
@@ -786,6 +848,7 @@ class WechatCodexService:
                 cwd=cwd,
                 session_id=active_id,
                 on_update=None,
+                run_handle=run_handle,
             )
         except Exception as e:
             err_msg = self._format_prompt_response(session_label, f"调用 Codex 时出现异常: {e}")
@@ -794,7 +857,7 @@ class WechatCodexService:
         finally:
             if typing is not None:
                 typing.stop()
-            self.running_prompts.finish(actor_id, active_id)
+            self.running_prompts.finish(actor_id, active_id, run_handle)
 
         elapsed_sec = round(time.time() - run_started_at, 2)
         log(
@@ -813,6 +876,10 @@ class WechatCodexService:
                 thread_id,
                 str(cwd),
             )
+
+        if return_code == 130:
+            self._send_text(actor_id, context_token, self._format_prompt_response(final_session_label, answer))
+            return
 
         if return_code != 0:
             msg = f"Codex 执行失败 (exit={return_code})\n{answer}"

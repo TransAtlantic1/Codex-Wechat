@@ -351,12 +351,22 @@ class RunningPromptRegistry:
         self._lock = threading.Lock()
         self._running_counts: Dict[str, int] = {}
         self._running_sessions: Dict[str, Set[str]] = {}
+        self._handles: Dict[str, Dict[str, List["CodexRunHandle"]]] = {}
 
     @staticmethod
     def _actor_key(actor: StateActor) -> str:
         return str(actor)
 
-    def try_start(self, actor: StateActor, session_id: Optional[str]) -> bool:
+    @staticmethod
+    def _session_key(session_id: Optional[str]) -> str:
+        return BotState._normalize_session_id(session_id) or "__new_session__"
+
+    def try_start(
+        self,
+        actor: StateActor,
+        session_id: Optional[str],
+        handle: Optional["CodexRunHandle"] = None,
+    ) -> bool:
         actor_key = self._actor_key(actor)
         normalized_session_id = BotState._normalize_session_id(session_id)
         with self._lock:
@@ -366,9 +376,17 @@ class RunningPromptRegistry:
                     return False
                 sessions.add(normalized_session_id)
             self._running_counts[actor_key] = self._running_counts.get(actor_key, 0) + 1
+            if handle is not None:
+                session_key = self._session_key(session_id)
+                self._handles.setdefault(actor_key, {}).setdefault(session_key, []).append(handle)
             return True
 
-    def finish(self, actor: StateActor, session_id: Optional[str]) -> None:
+    def finish(
+        self,
+        actor: StateActor,
+        session_id: Optional[str],
+        handle: Optional["CodexRunHandle"] = None,
+    ) -> None:
         actor_key = self._actor_key(actor)
         normalized_session_id = BotState._normalize_session_id(session_id)
         with self._lock:
@@ -385,10 +403,84 @@ class RunningPromptRegistry:
                     if not sessions:
                         self._running_sessions.pop(actor_key, None)
 
+            if handle is not None:
+                session_key = self._session_key(session_id)
+                actor_handles = self._handles.get(actor_key)
+                if actor_handles is not None:
+                    handles = actor_handles.get(session_key)
+                    if handles is not None:
+                        try:
+                            handles.remove(handle)
+                        except ValueError:
+                            pass
+                        if not handles:
+                            actor_handles.pop(session_key, None)
+                    if not actor_handles:
+                        self._handles.pop(actor_key, None)
+
     def count(self, actor: StateActor) -> int:
         actor_key = self._actor_key(actor)
         with self._lock:
             return self._running_counts.get(actor_key, 0)
+
+    def is_running(self, actor: StateActor, session_id: Optional[str]) -> bool:
+        actor_key = self._actor_key(actor)
+        session_key = self._session_key(session_id)
+        with self._lock:
+            return bool(self._handles.get(actor_key, {}).get(session_key))
+
+    def cancel(self, actor: StateActor, session_id: Optional[str]) -> bool:
+        actor_key = self._actor_key(actor)
+        session_key = self._session_key(session_id)
+        with self._lock:
+            handles = self._handles.get(actor_key, {}).get(session_key) or []
+            handle = handles[-1] if handles else None
+        return handle.cancel() if handle is not None else False
+
+
+class CodexRunHandle:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._proc: Optional[subprocess.Popen[str]] = None
+        self._cancel_requested = False
+
+    @property
+    def cancel_requested(self) -> bool:
+        with self._lock:
+            return self._cancel_requested
+
+    def bind_process(self, proc: subprocess.Popen[str]) -> None:
+        with self._lock:
+            self._proc = proc
+            should_cancel = self._cancel_requested
+        if should_cancel:
+            self._terminate_process_tree(proc, force=False)
+
+    def cancel(self) -> bool:
+        with self._lock:
+            if self._cancel_requested:
+                return False
+            self._cancel_requested = True
+            proc = self._proc
+        if proc is not None:
+            self._terminate_process_tree(proc, force=False)
+        return True
+
+    @staticmethod
+    def _terminate_process_tree(proc: subprocess.Popen[str], force: bool = False) -> None:
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        try:
+            os.killpg(proc.pid, sig)
+            return
+        except Exception:
+            pass
+        try:
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+        except Exception:
+            pass
 
 
 class CodexRunner:
@@ -443,6 +535,7 @@ class CodexRunner:
         cwd: Path,
         session_id: Optional[str] = None,
         on_update: Optional[Callable[[str], None]] = None,
+        run_handle: Optional[CodexRunHandle] = None,
     ) -> Tuple[Optional[str], str, str, int]:
         config_flags: List[str] = []
         if self.dangerous_bypass_level == 1:
@@ -487,6 +580,8 @@ class CodexRunner:
             )
         except FileNotFoundError as e:
             return None, f"找不到 codex 可执行文件: {self.codex_bin}", str(e), 127
+        if run_handle is not None:
+            run_handle.bind_process(proc)
 
         stdout_lines: List[str] = []
         stderr_chunks: List[str] = []
@@ -622,7 +717,31 @@ class CodexRunner:
                 agent_text = f"{timeout_text}\n\n{agent_text}"
             else:
                 agent_text = timeout_text
+        if run_handle is not None and run_handle.cancel_requested:
+            cancel_text = "已停止当前 Codex 任务。"
+            if agent_text and agent_text != "Codex 没有返回可展示内容。":
+                agent_text = f"{cancel_text}\n\n已产生的部分输出:\n{agent_text}"
+            else:
+                agent_text = cancel_text
+            return_code = 130
         return thread_id, agent_text, stderr_text, return_code
+
+    def usage_status(self, timeout_sec: int = 15) -> Tuple[str, str, int]:
+        cmd = [self.codex_bin, "login", "status"]
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout_sec,
+            )
+        except FileNotFoundError as e:
+            return "", f"找不到 codex 可执行文件: {self.codex_bin}\n{e}", 127
+        except subprocess.TimeoutExpired:
+            return "", f"查询 Codex 登录状态超时（>{timeout_sec}s）。", 124
+        return proc.stdout.strip(), proc.stderr.strip(), proc.returncode
 
     @staticmethod
     def _parse_exec_json(stdout: str) -> Tuple[Optional[str], str]:

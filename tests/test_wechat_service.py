@@ -6,7 +6,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from codex_common import BotState, SessionStore
+from codex_common import BotState, CodexRunHandle, SessionStore
 from wechat_codex_service import (
     WechatAPI,
     WechatAccountStore,
@@ -51,9 +51,12 @@ class FakeCodexRunner:
     def __init__(self) -> None:
         self.calls = []
 
-    def run_prompt(self, prompt, cwd, session_id=None, on_update=None):
+    def run_prompt(self, prompt, cwd, session_id=None, on_update=None, run_handle=None):
         self.calls.append((prompt, str(cwd), session_id))
         return ("thread-123", f"answer:{prompt}", "", 0)
+
+    def usage_status(self):
+        return ("Logged in using ChatGPT", "", 0)
 
 
 class RecordingWechatAPI:
@@ -282,6 +285,71 @@ class WechatServiceTests(unittest.TestCase):
                 "wechat prompt should not emit the removed ack text",
             )
             self.assertTrue(any("answer:hello" in text for _, _, text in api.sent))
+
+    def test_kill_cancels_only_current_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            api = RecordingWechatAPI()
+            state = BotState(root / "state.json")
+            state.set_active_session("user@im.wechat", "sess-current", str(root))
+            service = WechatCodexService(
+                api=api,
+                sessions=SessionStore(root / "sessions"),
+                state=state,
+                codex=FakeCodexRunner(),
+                default_cwd=root,
+                allowed_user_ids={"user@im.wechat"},
+                poll_timeout_sec=35,
+                send_typing_enabled=False,
+                account_store=WechatAccountStore(root / "wechat"),
+            )
+            current_handle = CodexRunHandle()
+            other_handle = CodexRunHandle()
+            self.assertTrue(service.running_prompts.try_start("user@im.wechat", "sess-current", current_handle))
+            self.assertTrue(service.running_prompts.try_start("user@im.wechat", "sess-other", other_handle))
+
+            service._handle_message(
+                {
+                    "message_type": 1,
+                    "message_id": 4,
+                    "from_user_id": "user@im.wechat",
+                    "context_token": "ctx-4",
+                    "item_list": [{"type": 1, "text_item": {"text": "/kill"}}],
+                }
+            )
+
+            self.assertTrue(current_handle.cancel_requested)
+            self.assertFalse(other_handle.cancel_requested)
+            self.assertTrue(any("已请求停止当前会话" in text for _, _, text in api.sent))
+
+    def test_usage_command_reports_login_status_and_limit_note(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            api = RecordingWechatAPI()
+            service = WechatCodexService(
+                api=api,
+                sessions=SessionStore(root / "sessions"),
+                state=BotState(root / "state.json"),
+                codex=FakeCodexRunner(),
+                default_cwd=root,
+                allowed_user_ids={"user@im.wechat"},
+                poll_timeout_sec=35,
+                send_typing_enabled=False,
+                account_store=WechatAccountStore(root / "wechat"),
+            )
+
+            service._handle_message(
+                {
+                    "message_type": 1,
+                    "message_id": 5,
+                    "from_user_id": "user@im.wechat",
+                    "context_token": "ctx-5",
+                    "item_list": [{"type": 1, "text_item": {"text": "/usage"}}],
+                }
+            )
+
+            self.assertTrue(any("Logged in using ChatGPT" in text for _, _, text in api.sent))
+            self.assertTrue(any("没有提供可机器读取" in text for _, _, text in api.sent))
 
 
 if __name__ == "__main__":
