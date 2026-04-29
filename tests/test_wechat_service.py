@@ -6,7 +6,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from codex_common import BotState, CodexRunHandle, SessionStore
+from codex_common import BotState, CodexRunHandle, CodexRunner, SessionStore
 from wechat_codex_service import (
     WechatAPI,
     WechatAccountStore,
@@ -56,7 +56,7 @@ class FakeCodexRunner:
         return ("thread-123", f"answer:{prompt}", "", 0)
 
     def usage_status(self):
-        return ("Logged in using ChatGPT", "", 0)
+        return ("5h limit: [████░░] 37% left\nWeekly limit: [████████░] 89% left", "", 0)
 
 
 class RecordingWechatAPI:
@@ -322,7 +322,7 @@ class WechatServiceTests(unittest.TestCase):
             self.assertFalse(other_handle.cancel_requested)
             self.assertTrue(any("已请求停止当前会话" in text for _, _, text in api.sent))
 
-    def test_usage_command_reports_login_status_and_limit_note(self) -> None:
+    def test_usage_command_reports_limits(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             api = RecordingWechatAPI()
@@ -348,8 +348,27 @@ class WechatServiceTests(unittest.TestCase):
                 }
             )
 
-            self.assertTrue(any("Logged in using ChatGPT" in text for _, _, text in api.sent))
-            self.assertTrue(any("没有提供可机器读取" in text for _, _, text in api.sent))
+            self.assertTrue(any("5h limit" in text for _, _, text in api.sent))
+            self.assertTrue(any("Weekly limit" in text for _, _, text in api.sent))
+            self.assertTrue(any("rate_limits" in text for _, _, text in api.sent))
+
+    def test_codex_runner_formats_rate_limits(self) -> None:
+        formatted = CodexRunner._format_rate_limits(
+            {
+                "primary": {"used_percent": 63.0, "window_minutes": 300, "resets_at": 1777460829},
+                "secondary": {"used_percent": 11.0, "window_minutes": 10080, "resets_at": 1777996957},
+                "credits": None,
+                "plan_type": "plus",
+            }
+        )
+
+        self.assertIsNotNone(formatted)
+        assert formatted is not None
+        self.assertIn("5h limit:", formatted)
+        self.assertIn("37% left", formatted)
+        self.assertIn("Weekly limit:", formatted)
+        self.assertIn("89% left", formatted)
+        self.assertIn("Plan: plus", formatted)
 
 
 if __name__ == "__main__":

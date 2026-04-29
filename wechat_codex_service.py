@@ -551,7 +551,7 @@ class WechatCodexService:
                     "/new [cwd] - 进入新会话模式（下一条普通消息会新建 session）",
                     "/status - 查看当前绑定会话",
                     "/kill - 停止当前会话中正在思考的 Codex 任务",
-                    "/usage - 查看当前 Codex 登录状态和用量限额说明",
+                    "/usage - 查看当前 Codex 用量限额和剩余额度",
                     "/ask <内容> - 手动提问（可选）",
                     "",
                     "别名:",
@@ -747,8 +747,7 @@ class WechatCodexService:
         lines.extend(
             [
                 "",
-                "说明: 当前 Codex CLI 没有提供可机器读取的剩余额度/重置时间命令。",
-                "这里展示的是本机 Codex 登录状态；若后续 CLI 增加限额接口，/usage 可直接接入。",
+                "来源: 本机 Codex 状态（优先读取会话 rate_limits，必要时使用 CLI /status）。",
             ]
         )
         self._send_text(actor_id, context_token, "\n".join(lines))

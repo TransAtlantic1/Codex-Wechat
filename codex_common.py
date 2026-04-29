@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import json
 import os
+import pty
+import re
+import select
 import shutil
 import signal
 import subprocess
@@ -726,7 +729,42 @@ class CodexRunner:
             return_code = 130
         return thread_id, agent_text, stderr_text, return_code
 
-    def usage_status(self, timeout_sec: int = 15) -> Tuple[str, str, int]:
+    @staticmethod
+    def _clean_tui_status_output(raw: str) -> str:
+        ansi_re = re.compile(
+            r"\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])"
+        )
+        text = ansi_re.sub("", raw).replace("\r", "\n")
+        useful: List[str] = []
+        seen: Set[str] = set()
+        keep_markers = (
+            "OpenAI Codex",
+            "Visit ",
+            "information on rate limits",
+            "Model:",
+            "Directory:",
+            "Permissions:",
+            "Account:",
+            "5h limit:",
+            "Weekly limit:",
+            "(resets ",
+        )
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            for ch in "╭╮╰╯─│":
+                line = line.replace(ch, " ")
+            line = " ".join(line.split())
+            if not line or not any(marker in line for marker in keep_markers):
+                continue
+            if line in seen:
+                continue
+            seen.add(line)
+            useful.append(line)
+        return "\n".join(useful).strip()
+
+    def _login_status(self, timeout_sec: int = 15) -> Tuple[str, str, int]:
         cmd = [self.codex_bin, "login", "status"]
         try:
             proc = subprocess.run(
@@ -742,6 +780,221 @@ class CodexRunner:
         except subprocess.TimeoutExpired:
             return "", f"查询 Codex 登录状态超时（>{timeout_sec}s）。", 124
         return proc.stdout.strip(), proc.stderr.strip(), proc.returncode
+
+    @staticmethod
+    def _format_reset_time(reset_ts: Any) -> str:
+        try:
+            reset_at = int(reset_ts)
+        except (TypeError, ValueError):
+            return "unknown"
+        reset_local = time.localtime(reset_at)
+        now_local = time.localtime()
+        clock = time.strftime("%H:%M", reset_local)
+        if (
+            reset_local.tm_year == now_local.tm_year
+            and reset_local.tm_yday == now_local.tm_yday
+        ):
+            return clock
+        month = time.strftime("%b", reset_local)
+        return f"{clock} on {reset_local.tm_mday} {month}"
+
+    @staticmethod
+    def _format_limit_label(window_minutes: Any, fallback: str) -> str:
+        try:
+            minutes = int(window_minutes)
+        except (TypeError, ValueError):
+            return fallback
+        if minutes == 300:
+            return "5h limit"
+        if minutes == 10080:
+            return "Weekly limit"
+        if minutes > 0 and minutes % 60 == 0:
+            return f"{minutes // 60}h limit"
+        if minutes > 0:
+            return f"{minutes}m limit"
+        return fallback
+
+    @staticmethod
+    def _format_usage_bar(left_percent: float) -> str:
+        filled = max(0, min(20, int(round(left_percent / 5.0))))
+        return "[" + ("█" * filled) + ("░" * (20 - filled)) + "]"
+
+    @classmethod
+    def _format_rate_limits(cls, rate_limits: Dict[str, Any]) -> Optional[str]:
+        lines: List[str] = []
+        for key, fallback_label in (("primary", "Primary limit"), ("secondary", "Secondary limit")):
+            limit = rate_limits.get(key)
+            if not isinstance(limit, dict):
+                continue
+            try:
+                used_percent = float(limit.get("used_percent"))
+            except (TypeError, ValueError):
+                continue
+            left_percent = max(0.0, min(100.0, 100.0 - used_percent))
+            left_display = int(round(left_percent))
+            label = cls._format_limit_label(limit.get("window_minutes"), fallback_label)
+            reset = cls._format_reset_time(limit.get("resets_at"))
+            lines.append(
+                f"{label}: {cls._format_usage_bar(left_percent)} "
+                f"{left_display}% left (resets {reset})"
+            )
+
+        credits = rate_limits.get("credits")
+        if isinstance(credits, dict):
+            remaining = credits.get("remaining")
+            if remaining is None:
+                remaining = credits.get("available")
+            total = credits.get("total")
+            if total is None:
+                total = credits.get("limit")
+            if remaining is not None and total is not None:
+                lines.append(f"Credits: {remaining}/{total} remaining")
+            elif remaining is not None:
+                lines.append(f"Credits: {remaining} remaining")
+
+        plan_type = rate_limits.get("plan_type")
+        if plan_type:
+            lines.append(f"Plan: {plan_type}")
+        return "\n".join(lines).strip() or None
+
+    @staticmethod
+    def _tail_lines(path: Path, max_lines: int = 600, max_bytes: int = 4 * 1024 * 1024) -> List[str]:
+        try:
+            with path.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                end = f.tell()
+                size = min(end, max_bytes)
+                f.seek(end - size)
+                data = f.read(size)
+        except Exception:
+            return []
+        text = data.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        return lines[-max_lines:]
+
+    def _usage_status_from_session_snapshots(self) -> Optional[str]:
+        codex_home = Path(env("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+        sessions_root = codex_home / "sessions"
+        if not sessions_root.exists():
+            return None
+        try:
+            files = sorted(
+                sessions_root.rglob("*.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            return None
+        for path in files[:80]:
+            for line in reversed(self._tail_lines(path)):
+                if '"rate_limits"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = event.get("payload")
+                if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                    continue
+                rate_limits = payload.get("rate_limits")
+                if not isinstance(rate_limits, dict):
+                    continue
+                formatted = self._format_rate_limits(rate_limits)
+                if formatted:
+                    return formatted
+        return None
+
+    def usage_status(self, timeout_sec: int = 20) -> Tuple[str, str, int]:
+        snapshot = self._usage_status_from_session_snapshots()
+        if snapshot:
+            return snapshot, "", 0
+
+        master_fd: Optional[int] = None
+        slave_fd: Optional[int] = None
+        proc: Optional[subprocess.Popen[str]] = None
+        output_chunks: List[str] = []
+        try:
+            master_fd, slave_fd = pty.openpty()
+            env = os.environ.copy()
+            env.setdefault("TERM", "xterm")
+            env.setdefault("COLUMNS", "100")
+            env.setdefault("LINES", "30")
+            proc = subprocess.Popen(
+                [self.codex_bin, "--no-alt-screen"],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                text=False,
+                start_new_session=True,
+                env=env,
+            )
+            os.close(slave_fd)
+            slave_fd = None
+            os.write(master_fd, b"\x1b[1;1R")
+            time.sleep(1.5)
+            os.write(master_fd, b"/status\r")
+
+            started_at = time.monotonic()
+            retried_submit = False
+            while time.monotonic() - started_at < timeout_sec:
+                readable, _, _ = select.select([master_fd], [], [], 0.2)
+                if readable:
+                    try:
+                        chunk = os.read(master_fd, 8192)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    output_chunks.append(chunk.decode("utf-8", errors="replace"))
+
+                elapsed = time.monotonic() - started_at
+                raw_output = "".join(output_chunks)
+                if not retried_submit and elapsed >= 4.0:
+                    os.write(master_fd, b"\r")
+                    retried_submit = True
+
+                if "5h limit:" in raw_output and "Weekly limit:" in raw_output:
+                    break
+
+            raw_output = "".join(output_chunks)
+            cleaned = self._clean_tui_status_output(raw_output)
+            if cleaned and ("5h limit:" in cleaned or "Weekly limit:" in cleaned):
+                return cleaned, "", 0
+
+            login_stdout, login_stderr, login_code = self._login_status(timeout_sec=10)
+            fallback = login_stdout.strip()
+            if fallback:
+                fallback = f"{fallback}\n未能从交互式 /status 捕获限额信息。"
+            return fallback, login_stderr, login_code or 1
+        except FileNotFoundError as e:
+            return "", f"找不到 codex 可执行文件: {self.codex_bin}\n{e}", 127
+        except Exception as e:
+            login_stdout, login_stderr, login_code = self._login_status(timeout_sec=10)
+            fallback = login_stdout.strip()
+            detail = f"读取交互式 /status 失败: {e}"
+            if fallback:
+                fallback = f"{fallback}\n{detail}"
+            stderr_text = "\n".join(x for x in (login_stderr.strip(), detail) if x)
+            return fallback, stderr_text, login_code or 1
+        finally:
+            if proc is not None and proc.poll() is None:
+                try:
+                    self._terminate_process_tree(proc, force=False)
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self._terminate_process_tree(proc, force=True)
+                except Exception:
+                    pass
+            if slave_fd is not None:
+                try:
+                    os.close(slave_fd)
+                except Exception:
+                    pass
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except Exception:
+                    pass
 
     @staticmethod
     def _parse_exec_json(stdout: str) -> Tuple[Optional[str], str]:
